@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from alpaca_manager import AlpacaManager, AlpacaConnectionError
@@ -29,6 +29,15 @@ SENTIMENT_SELL_THRESHOLD = -0.3  # Sell se sentiment < -0.3
 MIN_CONFIDENCE = 0.5             # Ignora se confidence < 0.5
 POSITION_SIZE_PCT = 0.1          # 10% del portfolio per trade
 MAX_NOTIONAL = 1000.0            # Max notional per trade
+MAX_NEWS_AGE_MINUTES = 60        # Ignora notizie più vecchie
+
+
+def _news_age_minutes(created_at: str) -> float:
+    try:
+        ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return float("inf")
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 60
 
 
 class NewsBot:
@@ -49,12 +58,15 @@ class NewsBot:
         """Inizializza le connessioni a Supabase e Alpaca."""
         try:
             self.supabase = await SupabaseManager().connect()
-            self.alpaca = await AlpacaManager().connect()
+            api_key = await self.supabase.resolve_secret("ALPACA_API_KEY")
+            secret_key = await self.supabase.resolve_secret("ALPACA_SECRET_KEY")
+            self.alpaca = await AlpacaManager(api_key=api_key, secret_key=secret_key).connect()
             self.analyzer = SentimentAnalyzer(mode=self.sentiment_mode)
-            logger.info("Bot connesso a Supabase e Alpaca")
+            logger.info("Bot connesso a Supabase e Alpaca (dry_run=%s)", self.dry_run)
             return self
-        except (SupabaseConnectionError, AlpacaConnectionError) as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error("Errore di connessione: %s", exc)
+            await self.close()
             raise
 
     async def close(self) -> None:
@@ -79,6 +91,10 @@ class NewsBot:
         await self.supabase.log("INFO", "Bot loop started")
 
         try:
+            if not await self.alpaca.is_market_open():
+                await self.supabase.log("INFO", "Mercato chiuso: nessuna operazione")
+                return
+
             # 1. Recupera i ticker attivi
             tickers = await self.supabase.get_active_tickers()
             if not tickers:
@@ -101,8 +117,9 @@ class NewsBot:
             logger.info("Recuperate %d notizie", len(news_items))
 
             # 3. Processa ogni notizia
+            active = {t.upper() for t in tickers}
             for news in news_items:
-                await self._process_news(news)
+                await self._process_news(news, active)
 
             await self.supabase.log("INFO", "Bot loop completed")
 
@@ -110,32 +127,39 @@ class NewsBot:
             logger.exception("Errore nel loop del bot")
             await self.supabase.log("ERROR", f"Errore nel bot loop: {exc}")
 
-    async def _process_news(self, news) -> None:
+    async def _process_news(self, news, active: set[str]) -> None:
         """Processa una singola notizia."""
         if not self.supabase or not self.alpaca or not self.analyzer:
             return
 
-        news_id = news.id
         headline = news.headline
         summary = news.summary
-        symbols = news.symbols or []
+        # Le notizie Alpaca citano spesso anche ticker non monitorati
+        tickers = sorted({s.upper() for s in (news.symbols or [])} & active)
+        if not tickers:
+            return
 
-        logger.info("Processing news %s: %s", news_id, headline[:60])
+        age = _news_age_minutes(news.created_at)
+        if age > MAX_NEWS_AGE_MINUTES:
+            logger.debug("News %s troppo vecchia (%.0f min)", news.id, age)
+            return
 
-        for ticker in symbols:
+        logger.info("Processing news %s: %s", news.id, headline[:60])
+        sentiment = None
+
+        for ticker in tickers:
+            # Chiave per (notizia, ticker): una notizia su più ticker va valutata per ciascuno
+            news_id = f"{news.id}:{ticker}"
             try:
-                ticker = ticker.upper()
-
-                # Prova a "prenotare" la notizia
                 claimed = await self.supabase.claim_news(news_id, ticker, headline)
                 if not claimed:
-                    logger.debug("News %s già processata per %s", news_id, ticker)
+                    logger.debug("News %s già processata", news_id)
                     continue
 
-                logger.info("Claimed news %s for %s", news_id, ticker)
+                logger.info("Claimed news %s", news_id)
 
-                # Analizza il sentiment
-                sentiment = await self.analyzer.analyze(summary, headline)
+                if sentiment is None:
+                    sentiment = await self.analyzer.analyze(summary or headline, headline)
                 logger.info("Sentiment for %s: %s", ticker, sentiment)
 
                 # Aggiorna il sentiment sulla news
@@ -168,20 +192,28 @@ class NewsBot:
             return
 
         try:
-            # Recupera il quote
-            quote = await self.alpaca.get_quote(ticker)
-            if not quote or not quote.get("bid_price"):
-                logger.warning("Quote non disponibile per %s", ticker)
-                await self.supabase.log("WARNING", f"Quote non disponibile per {ticker}", ticker=ticker)
+            if await self.alpaca.has_exposure(ticker):
+                logger.info("Posizione/ordine già aperto su %s: skip", ticker)
+                await self.supabase.update_news_status(news_id, "SKIPPED")
                 return
 
-            entry_price = quote["bid_price"] if side == "sell" else quote["ask_price"]
+            quote = await self.alpaca.get_quote(ticker)
+            entry_price = quote.get("bid_price") if side == "sell" else quote.get("ask_price")
+            if not entry_price or entry_price <= 0:
+                logger.warning("Quote non disponibile per %s", ticker)
+                await self.supabase.log("WARNING", f"Quote non disponibile per {ticker}", ticker=ticker)
+                await self.supabase.update_news_status(news_id, "SKIPPED")
+                return
 
             # Calcola la quantità basato sul portfolio size
             account = await self.alpaca.get_account()
             portfolio_value = float(account.get("portfolio_value", 0))
             notional = min(portfolio_value * POSITION_SIZE_PCT, MAX_NOTIONAL)
-            qty = max(1, int(notional / entry_price))
+            qty = int(notional / entry_price)
+            if qty < 1:
+                logger.info("Prezzo di %s troppo alto per il notional massimo: skip", ticker)
+                await self.supabase.update_news_status(news_id, "SKIPPED")
+                return
 
             logger.info("Executing %s order for %s: %d @ %.2f (sentiment=%.4f)",
                        side, ticker, qty, entry_price, sentiment)
@@ -263,17 +295,18 @@ class NewsBot:
             logger.exception("Errore fatale nel scheduled loop")
 
 
-# ---------------------------------------------------------------------- smoke test
-async def _smoke_test() -> None:
+# ---------------------------------------------------------------------- entry point
+async def _main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+    mode = os.getenv("SENTIMENT_MODE", "vader")
 
-    async with NewsBot(sentiment_mode="vader", dry_run=True) as bot:
-        logger.info("=== Running single bot iteration (DRY RUN) ===")
+    async with NewsBot(sentiment_mode=mode, dry_run=dry_run) as bot:
         await bot.run_once()
 
 
 if __name__ == "__main__":
-    asyncio.run(_smoke_test())
+    asyncio.run(_main())

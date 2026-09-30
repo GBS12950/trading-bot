@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -72,7 +72,7 @@ class SentimentAnalyzer:
 
             # Scarica i dati VADER (se non presenti)
             try:
-                nltk.data.find("vader_lexicon")
+                nltk.data.find("sentiment/vader_lexicon.zip")
             except LookupError:
                 nltk.download("vader_lexicon", quiet=True)
 

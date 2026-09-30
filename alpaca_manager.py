@@ -112,6 +112,22 @@ class AlpacaManager:
         res.raise_for_status()
         return res.json()
 
+    async def is_market_open(self) -> bool:
+        res = await self.client.get("/v2/clock")
+        res.raise_for_status()
+        return bool(res.json().get("is_open"))
+
+    async def has_exposure(self, symbol: str) -> bool:
+        """True se esiste già una posizione o un ordine aperto sul simbolo."""
+        symbol = symbol.upper()
+        res = await self.client.get(f"/v2/positions/{symbol}")
+        if res.status_code == 200:
+            return True
+        if res.status_code != 404:
+            res.raise_for_status()
+        orders = await self.get_orders(status="open")
+        return any(o.symbol == symbol for o in orders)
+
     # ------------------------------------------------------------------ news
     async def get_news(
         self,
