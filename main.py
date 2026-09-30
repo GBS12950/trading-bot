@@ -324,9 +324,10 @@ class NewsBot:
 
             logger.info("Order placed: %s (status=%s)", order.order_id, order.status)
 
-            # Registra il trade su Supabase
-            sl_price = entry_price * (1 - 0.02) if side == "buy" else entry_price * (1 + 0.02)
-            tp_price = entry_price * (1 + 0.05) if side == "buy" else entry_price * (1 - 0.05)
+            # Registra il trade con i livelli effettivamente inviati ad Alpaca
+            entry_price = order.entry_price or entry_price
+            sl_price = order.stop_loss
+            tp_price = order.take_profit
 
             await self.supabase.record_trade(
                 news_id=news_id,

@@ -48,9 +48,9 @@ async def _main() -> None:
                 stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT,
             )
 
-        sign = 1 if side == "buy" else -1
-        sl = price * (1 - sign * STOP_LOSS_PCT)
-        tp = price * (1 + sign * TAKE_PROFIT_PCT)
+        price = order.entry_price or price
+        sl = order.stop_loss
+        tp = order.take_profit
 
         await db.record_trade(
             news_id=None, ticker=symbol, side=side, qty=qty, entry_price=price,

@@ -45,6 +45,9 @@ class Order:
     status: str
     filled_qty: float
     filled_avg_price: Optional[float]
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
 
 
 class AlpacaConnectionError(RuntimeError):
@@ -234,33 +237,44 @@ class AlpacaManager:
             # Se entry_price non è fornito, recupera il prezzo di mercato
             if entry_price is None:
                 quote = await self.get_quote(symbol)
-                entry_price = quote.get("ask_price", quote.get("bid_price", 100.0))
+                entry_price = quote.get("ask_price") or quote.get("bid_price")
+            if not entry_price:
+                raise AlpacaConnectionError(f"Prezzo di riferimento non disponibile per {symbol}")
 
-            # Calcola SL e TP
-            if side.lower() == "buy":
-                stop_loss_price = entry_price * (1 - stop_loss_pct)
-                take_profit_price = entry_price * (1 + take_profit_pct)
-            else:  # sell
-                stop_loss_price = entry_price * (1 + stop_loss_pct)
-                take_profit_price = entry_price * (1 - take_profit_pct)
+            # Il prezzo IEX può differire da quello di Alpaca: al primo rifiuto 422
+            # si ricalcolano SL/TP sul base_price indicato da Alpaca
+            for attempt in range(2):
+                if side.lower() == "buy":
+                    stop_loss_price = entry_price * (1 - stop_loss_pct)
+                    take_profit_price = entry_price * (1 + take_profit_pct)
+                else:
+                    stop_loss_price = entry_price * (1 + stop_loss_pct)
+                    take_profit_price = entry_price * (1 - take_profit_pct)
 
-            # Ordine principale (Market)
-            order_payload = {
-                "symbol": symbol.upper(),
-                "qty": qty,
-                "side": side.lower(),
-                "type": "market",
-                "time_in_force": "day",
-                "order_class": "bracket",
-                "take_profit": {
-                    "limit_price": round(take_profit_price, 2),
-                },
-                "stop_loss": {
-                    "stop_price": round(stop_loss_price, 2),
-                },
-            }
+                order_payload = {
+                    "symbol": symbol.upper(),
+                    "qty": qty,
+                    "side": side.lower(),
+                    "type": "market",
+                    "time_in_force": "day",
+                    "order_class": "bracket",
+                    "take_profit": {"limit_price": round(take_profit_price, 2)},
+                    "stop_loss": {"stop_price": round(stop_loss_price, 2)},
+                }
+                res = await self.client.post("/v2/orders", json=order_payload)
 
-            res = await self.client.post("/v2/orders", json=order_payload)
+                if res.status_code == 422 and attempt == 0:
+                    try:
+                        base_price = float(res.json().get("base_price") or 0)
+                    except (ValueError, TypeError):
+                        base_price = 0.0
+                    if base_price > 0:
+                        logger.warning("%s: prezzo %.2f rifiutato, ricalcolo SL/TP su base_price %.2f",
+                                       symbol, entry_price, base_price)
+                        entry_price = base_price
+                        continue
+                break
+
             res.raise_for_status()
             data = res.json()
 
@@ -272,6 +286,9 @@ class AlpacaManager:
                 status=data.get("status", ""),
                 filled_qty=float(data.get("filled_qty", 0)),
                 filled_avg_price=float(data.get("filled_avg_price") or 0) or None,
+                entry_price=entry_price,
+                stop_loss=round(stop_loss_price, 2),
+                take_profit=round(take_profit_price, 2),
             )
 
             logger.info(
