@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -130,10 +131,16 @@ class NewsBot:
 
             # 3. Processa ogni notizia
             active = {t.upper() for t in tickers}
+            stats: Counter[str] = Counter()
             for news in news_items:
-                await self._process_news(news, active)
+                stats[await self._process_news(news, active)] += 1
 
-            await self.supabase.log("INFO", "Bot loop completed")
+            await self.supabase.log(
+                "INFO",
+                f"Notizie: {len(news_items)} scaricate, {stats['old']} più vecchie di "
+                f"{MAX_NEWS_AGE_MINUTES} min, {stats['seen']} già elaborate, {stats['new']} nuove",
+                context=dict(stats),
+            )
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Errore nel loop del bot")
@@ -156,25 +163,26 @@ class NewsBot:
             await self.notifier.notify(f"<b>Stop giornaliero</b>\n{esc(msg)}")
         return True
 
-    async def _process_news(self, news, active: set[str]) -> None:
-        """Processa una singola notizia."""
+    async def _process_news(self, news, active: set[str]) -> str:
+        """Processa una notizia e ritorna l'esito: untracked, old, seen o new."""
         if not self.supabase or not self.alpaca or not self.analyzer:
-            return
+            return "untracked"
 
         headline = news.headline
         summary = news.summary
         # Le notizie Alpaca citano spesso anche ticker non monitorati
         tickers = sorted({s.upper() for s in (news.symbols or [])} & active)
         if not tickers:
-            return
+            return "untracked"
 
         age = _news_age_minutes(news.created_at)
         if age > MAX_NEWS_AGE_MINUTES:
             logger.debug("News %s troppo vecchia (%.0f min)", news.id, age)
-            return
+            return "old"
 
         logger.info("Processing news %s: %s", news.id, headline[:60])
         sentiment = None
+        processed = False
 
         for ticker in tickers:
             # Chiave per (notizia, ticker): una notizia su più ticker va valutata per ciascuno
@@ -186,6 +194,7 @@ class NewsBot:
                     continue
 
                 logger.info("Claimed news %s", news_id)
+                processed = True
 
                 if sentiment is None:
                     sentiment = await self.analyzer.analyze(summary or headline, headline)
@@ -214,6 +223,8 @@ class NewsBot:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Errore nel processare news %s per %s", news_id, ticker)
                 await self.supabase.update_news_status(news_id, "FAILED")
+
+        return "new" if processed else "seen"
 
     async def _execute_trade(self, news_id: str, ticker: str, side: str, sentiment: float, headline: str) -> None:
         """Esegue un trade basato sul sentiment."""
