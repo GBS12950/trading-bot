@@ -62,7 +62,10 @@ async def build_report(db: SupabaseManager, alpaca: AlpacaManager, now_ny: datet
     ) or []
 
     trades = await db.get_rows_since("trades", "created_at", since_iso, "id")
-    news = await db.get_rows_since("processed_news", "processed_at", since_iso, "status")
+    news = [
+        r for r in await db.get_rows_since("processed_news", "processed_at", since_iso, "news_id,status")
+        if not str(r.get("news_id", "")).startswith("smoke-")
+    ]
     logs = await db.get_rows_since("bot_logs", "timestamp", since_iso, "level")
 
     start_eq = _f(account.get("last_equity"))
