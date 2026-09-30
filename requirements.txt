@@ -1,0 +1,22 @@
+# News Sentiment Trading Bot - Python Dependencies
+
+# Supabase (database + auth)
+supabase>=2.4.0
+
+# HTTP client (async)
+httpx>=0.24.0
+
+# Data parsing
+python-dateutil>=2.8.2
+
+# Sentiment Analysis
+nltk>=3.8.1
+
+# Optional: LLM integration (uncomment if using OpenAI)
+# openai>=1.0.0
+
+# Logging & monitoring (optional)
+python-json-logger>=2.0.7
+
+# Type hints
+typing-extensions>=4.5.0
