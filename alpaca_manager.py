@@ -143,7 +143,7 @@ class AlpacaManager:
     ) -> list[NewsItem]:
         """
         Recupera le ultime notizie per i simboli specificati.
-        Usa l'endpoint /v1beta3/news
+        Usa l'endpoint /v1beta1/news
 
         Args:
             symbols: Lista di ticker (es. ['AAPL', 'MSFT'])
@@ -173,7 +173,7 @@ class AlpacaManager:
             }
             async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
                 res = await client.get(
-                    f"{self.data_url}/v1beta3/news",
+                    f"{self.data_url}/v1beta1/news",
                     params=params,
                 )
                 res.raise_for_status()
