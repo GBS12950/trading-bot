@@ -175,6 +175,12 @@ class SupabaseManager:
         res = await self.client.table("active_tickers").select("ticker").eq("is_active", True).execute()
         return [r["ticker"] for r in (res.data or [])]
 
+    @with_retry
+    async def get_active_ticker_limits(self) -> dict[str, float]:
+        res = await (self.client.table("active_tickers").select("ticker,max_notional")
+                     .eq("is_active", True).execute())
+        return {r["ticker"].upper(): float(r["max_notional"]) for r in (res.data or [])}
+
     # ------------------------------------------------------------------ secrets
     @with_retry
     async def get_secret(self, name: str) -> Optional[str]:
@@ -187,6 +193,9 @@ class SupabaseManager:
         value = os.getenv(name) or await self.get_secret(name)
         if not value:
             raise ValueError(f"Segreto '{name}' non trovato né in env né in Supabase Vault.")
+        # Il repo è pubblico: i valori letti dal Vault vanno oscurati nei log di Actions
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            print(f"::add-mask::{value}", flush=True)
         return value
 
     # ------------------------------------------------------------------ news
@@ -225,6 +234,20 @@ class SupabaseManager:
                "entry_price": entry_price, "stop_loss": stop_loss, "take_profit": take_profit,
                "alpaca_order_id": alpaca_order_id, "status": status}
         await self.client.table("trades").upsert(row, on_conflict="alpaca_order_id").execute()
+
+    # ------------------------------------------------------------------ report
+    @with_retry
+    async def get_rows_since(self, table: str, ts_column: str, since_iso: str,
+                             columns: str = "*") -> list[dict[str, Any]]:
+        res = await self.client.table(table).select(columns).gte(ts_column, since_iso).execute()
+        return res.data or []
+
+    @with_retry
+    async def has_log_since(self, message_prefix: str, since_iso: str) -> bool:
+        res = await (self.client.table("bot_logs").select("id")
+                     .like("message", f"{message_prefix}%")
+                     .gte("timestamp", since_iso).limit(1).execute())
+        return bool(res.data)
 
 
 # ---------------------------------------------------------------------- smoke test

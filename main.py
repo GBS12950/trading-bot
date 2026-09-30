@@ -15,11 +15,13 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from alpaca_manager import AlpacaManager, AlpacaConnectionError
 from sentiment_analyzer import SentimentAnalyzer
-from supabase_manager import SupabaseManager, SupabaseConnectionError
+from supabase_manager import SupabaseManager
+from telegram_notifier import TelegramNotifier, esc
 
 logger = logging.getLogger("news_sentiment_bot")
 
@@ -28,8 +30,11 @@ SENTIMENT_BUY_THRESHOLD = 0.3   # Buy se sentiment > 0.3
 SENTIMENT_SELL_THRESHOLD = -0.3  # Sell se sentiment < -0.3
 MIN_CONFIDENCE = 0.5             # Ignora se confidence < 0.5
 POSITION_SIZE_PCT = 0.1          # 10% del portfolio per trade
-MAX_NOTIONAL = 1000.0            # Max notional per trade
+MAX_NOTIONAL = 1000.0            # Default se il ticker non ha max_notional
 MAX_NEWS_AGE_MINUTES = 60        # Ignora notizie più vecchie
+MAX_DAILY_LOSS_PCT = 0.02        # Stop nuove operazioni se il portafoglio perde il 2% nel giorno
+LOSS_LIMIT_MSG = "Limite di perdita giornaliera raggiunto"
+NY = ZoneInfo("America/New_York")
 
 
 def _news_age_minutes(created_at: str) -> float:
@@ -53,6 +58,8 @@ class NewsBot:
         self.supabase: Optional[SupabaseManager] = None
         self.alpaca: Optional[AlpacaManager] = None
         self.analyzer: Optional[SentimentAnalyzer] = None
+        self.notifier = TelegramNotifier(None, None)
+        self._limits: dict[str, float] = {}
 
     async def connect(self) -> "NewsBot":
         """Inizializza le connessioni a Supabase e Alpaca."""
@@ -62,6 +69,7 @@ class NewsBot:
             secret_key = await self.supabase.resolve_secret("ALPACA_SECRET_KEY")
             self.alpaca = await AlpacaManager(api_key=api_key, secret_key=secret_key).connect()
             self.analyzer = SentimentAnalyzer(mode=self.sentiment_mode)
+            self.notifier = await TelegramNotifier.from_supabase(self.supabase)
             logger.info("Bot connesso a Supabase e Alpaca (dry_run=%s)", self.dry_run)
             return self
         except Exception as exc:  # noqa: BLE001
@@ -95,8 +103,12 @@ class NewsBot:
                 await self.supabase.log("INFO", "Mercato chiuso: nessuna operazione")
                 return
 
-            # 1. Recupera i ticker attivi
-            tickers = await self.supabase.get_active_tickers()
+            if await self._daily_loss_limit_hit(await self.alpaca.get_account()):
+                return
+
+            # 1. Recupera i ticker attivi e i relativi limiti
+            self._limits = await self.supabase.get_active_ticker_limits()
+            tickers = list(self._limits)
             if not tickers:
                 await self.supabase.log("WARNING", "Nessun ticker attivo trovato")
                 return
@@ -126,6 +138,23 @@ class NewsBot:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Errore nel loop del bot")
             await self.supabase.log("ERROR", f"Errore nel bot loop: {exc}")
+            await self.notifier.notify(f"<b>Errore nel bot</b>\n{esc(exc)}")
+
+    async def _daily_loss_limit_hit(self, account: dict[str, Any]) -> bool:
+        start = float(account.get("last_equity") or 0)
+        now = float(account.get("equity") or 0)
+        if start <= 0 or (now - start) / start > -MAX_DAILY_LOSS_PCT:
+            return False
+
+        msg = f"{LOSS_LIMIT_MSG} ({(now - start) / start:+.2%}): nuove operazioni sospese fino a domani"
+        day_start = datetime.now(NY).replace(hour=0, minute=0, second=0, microsecond=0)
+        already_notified = await self.supabase.has_log_since(
+            LOSS_LIMIT_MSG, day_start.astimezone(timezone.utc).isoformat()
+        )
+        await self.supabase.log("WARNING", msg)
+        if not already_notified:
+            await self.notifier.notify(f"<b>Stop giornaliero</b>\n{esc(msg)}")
+        return True
 
     async def _process_news(self, news, active: set[str]) -> None:
         """Processa una singola notizia."""
@@ -208,7 +237,7 @@ class NewsBot:
             # Calcola la quantità basato sul portfolio size
             account = await self.alpaca.get_account()
             portfolio_value = float(account.get("portfolio_value", 0))
-            notional = min(portfolio_value * POSITION_SIZE_PCT, MAX_NOTIONAL)
+            notional = min(portfolio_value * POSITION_SIZE_PCT, self._limits.get(ticker, MAX_NOTIONAL))
             qty = int(notional / entry_price)
             if qty < 1:
                 logger.info("Prezzo di %s troppo alto per il notional massimo: skip", ticker)
@@ -276,11 +305,17 @@ class NewsBot:
                 ticker=ticker,
                 context={"order_id": order.order_id, "sentiment": sentiment},
             )
+            await self.notifier.notify(
+                f"<b>{side.upper()} {qty} {esc(ticker)}</b> @ ${entry_price:,.2f}\n"
+                f"SL ${sl_price:,.2f} | TP ${tp_price:,.2f} | sentiment {sentiment:+.2f}\n"
+                f"<i>{esc(headline[:200])}</i>"
+            )
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Errore nell'esecuzione del trade")
             await self.supabase.log("ERROR", f"Errore nell'esecuzione trade: {exc}", ticker=ticker)
             await self.supabase.update_news_status(news_id, "FAILED")
+            await self.notifier.notify(f"<b>Ordine fallito su {esc(ticker)}</b>\n{esc(exc)}")
 
     async def run_scheduled(self, interval_seconds: int = 300) -> None:
         """Esegue il bot periodicamente (intervallo in secondi)."""

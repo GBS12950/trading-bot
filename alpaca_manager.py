@@ -112,6 +112,11 @@ class AlpacaManager:
         res.raise_for_status()
         return res.json()
 
+    async def get_json(self, path: str, params: Optional[dict[str, Any]] = None) -> Any:
+        res = await self.client.get(path, params=params)
+        res.raise_for_status()
+        return res.json()
+
     async def is_market_open(self) -> bool:
         res = await self.client.get("/v2/clock")
         res.raise_for_status()

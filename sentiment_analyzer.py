@@ -18,6 +18,19 @@ import httpx
 
 logger = logging.getLogger("sentiment_analyzer")
 
+# VADER nasce per i social: questi termini finanziari mancano o hanno peso sbagliato
+FINANCE_LEXICON = {
+    "beat": 2.0, "beats": 2.0, "upgrade": 2.5, "upgraded": 2.5, "upgrades": 2.5,
+    "outperform": 2.5, "outperforms": 2.5, "surge": 2.5, "surges": 2.5, "soar": 2.5,
+    "soars": 2.5, "rally": 2.0, "rallies": 2.0, "bullish": 2.5, "buyback": 1.5,
+    "record": 1.5, "profit": 1.5, "profits": 1.5,
+    "miss": -2.0, "misses": -2.0, "missed": -2.0, "downgrade": -2.5, "downgraded": -2.5,
+    "downgrades": -2.5, "underperform": -2.5, "plunge": -3.0, "plunges": -3.0,
+    "tumble": -2.5, "tumbles": -2.5, "slump": -2.5, "slumps": -2.5, "bearish": -2.5,
+    "lawsuit": -2.0, "probe": -1.5, "recall": -2.0, "layoffs": -1.5, "bankruptcy": -3.5,
+    "fraud": -3.0, "investigation": -1.5, "loss": -1.5, "losses": -1.5,
+}
+
 
 class SentimentMode(Enum):
     """Modalità di analisi del sentiment."""
@@ -77,6 +90,7 @@ class SentimentAnalyzer:
                 nltk.download("vader_lexicon", quiet=True)
 
             self._vader_analyzer = SentimentIntensityAnalyzer()
+            self._vader_analyzer.lexicon.update(FINANCE_LEXICON)
             logger.info("VADER analyzer caricato")
         except ImportError:
             logger.error("nltk non installato. Installa con: pip install nltk")
