@@ -25,6 +25,7 @@ jobs:
       # since_close = notizie dalla chiusura precedente | minutes = ultime NEWS_MAX_AGE_MINUTES
       NEWS_WINDOW: since_close
       NEWS_MAX_AGE_MINUTES: "60"
+      MAX_OPEN_POSITIONS: "20"
     steps:
       - uses: actions/checkout@v5
 

@@ -37,6 +37,7 @@ MAX_NOTIONAL = 1000.0            # Default se il ticker non ha max_notional
 NEWS_WINDOW = os.getenv("NEWS_WINDOW", "since_close").lower()
 MAX_NEWS_AGE_MINUTES = int(os.getenv("NEWS_MAX_AGE_MINUTES", "60"))
 MAX_DAILY_LOSS_PCT = 0.02        # Stop nuove operazioni se il portafoglio perde il 2% nel giorno
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 LOSS_LIMIT_MSG = "Limite di perdita giornaliera raggiunto"
 NY = ZoneInfo("America/New_York")
 
@@ -134,11 +135,12 @@ class NewsBot:
 
             logger.info("Recuperate %d notizie", len(news_items))
 
-            # 3. Processa ogni notizia
+            # 3. Processa ogni notizia, saltando in blocco quelle già prenotate
+            seen = await self.supabase.get_processed_ids_since(window_start.isoformat())
             active = {t.upper() for t in tickers}
             stats: Counter[str] = Counter()
             for news in news_items:
-                stats[await self._process_news(news, active, window_start)] += 1
+                stats[await self._process_news(news, active, window_start, seen)] += 1
 
             await self.supabase.log(
                 "INFO",
@@ -186,7 +188,8 @@ class NewsBot:
         close_ny = datetime.fromisoformat(previous[-1]["date"]).replace(hour=hour, minute=minute, tzinfo=NY)
         return close_ny.astimezone(timezone.utc), f"dalla chiusura del {close_ny:%d/%m %H:%M} NY"
 
-    async def _process_news(self, news, active: set[str], window_start: datetime) -> str:
+    async def _process_news(self, news, active: set[str], window_start: datetime,
+                            seen: set[str]) -> str:
         """Processa una notizia e ritorna l'esito: untracked, old, seen o new."""
         if not self.supabase or not self.alpaca or not self.analyzer:
             return "untracked"
@@ -209,6 +212,8 @@ class NewsBot:
         for ticker in tickers:
             # Chiave per (notizia, ticker): una notizia su più ticker va valutata per ciascuno
             news_id = f"{news.id}:{ticker}"
+            if news_id in seen:
+                continue
             try:
                 claimed = await self.supabase.claim_news(news_id, ticker, headline)
                 if not claimed:
@@ -256,6 +261,12 @@ class NewsBot:
         try:
             if await self.alpaca.has_exposure(ticker):
                 logger.info("Posizione/ordine già aperto su %s: skip", ticker)
+                await self.supabase.update_news_status(news_id, "SKIPPED")
+                return
+
+            open_positions = await self.alpaca.get_json("/v2/positions") or []
+            if len(open_positions) >= MAX_OPEN_POSITIONS:
+                logger.info("Raggiunto il massimo di %d posizioni aperte: skip %s", MAX_OPEN_POSITIONS, ticker)
                 await self.supabase.update_news_status(news_id, "SKIPPED")
                 return
 

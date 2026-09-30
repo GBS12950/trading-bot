@@ -119,6 +119,23 @@ alter table public.active_tickers enable row level security;
 alter table public.trades         enable row level security;
 -- Nessuna policy = anon/authenticated bloccati; service_role bypassa RLS.
 
--- ---------- Seed di esempio ----------
-insert into public.active_tickers (ticker) values ('AAPL'), ('MSFT'), ('NVDA'), ('TSLA')
+-- ---------- Seed: ~100 titoli USA ad alta liquidità ----------
+insert into public.active_tickers (ticker) values
+    -- Tecnologia e semiconduttori
+    ('AAPL'), ('MSFT'), ('NVDA'), ('GOOGL'), ('META'), ('AMZN'), ('AVGO'), ('ORCL'), ('ADBE'), ('CRM'),
+    ('AMD'), ('INTC'), ('CSCO'), ('QCOM'), ('TXN'), ('AMAT'), ('MU'), ('LRCX'), ('KLAC'), ('ADI'),
+    ('MRVL'), ('ON'), ('ARM'), ('SMCI'), ('IBM'), ('NOW'), ('INTU'), ('DELL'), ('HPQ'), ('PLTR'),
+    ('SNOW'), ('PANW'), ('CRWD'), ('SHOP'), ('UBER'), ('ABNB'), ('NFLX'), ('PYPL'), ('COIN'), ('HOOD'),
+    -- Auto e consumi
+    ('TSLA'), ('F'), ('GM'), ('RIVN'), ('NKE'), ('MCD'), ('SBUX'), ('DIS'), ('WMT'), ('COST'),
+    ('HD'), ('LOW'), ('TGT'), ('KO'), ('PEP'), ('PG'),
+    -- Finanza
+    ('JPM'), ('BAC'), ('WFC'), ('C'), ('GS'), ('MS'), ('SCHW'), ('AXP'), ('BLK'), ('V'),
+    ('MA'), ('SOFI'),
+    -- Salute
+    ('LLY'), ('UNH'), ('JNJ'), ('ABBV'), ('MRK'), ('PFE'), ('BMY'), ('AMGN'), ('GILD'), ('CVS'),
+    ('TMO'), ('ABT'), ('ISRG'),
+    -- Energia, industria, telecomunicazioni
+    ('XOM'), ('CVX'), ('BA'), ('CAT'), ('DE'), ('GE'), ('HON'), ('LMT'), ('RTX'), ('UPS'),
+    ('FDX'), ('T'), ('VZ'), ('TMUS'), ('CMCSA')
 on conflict (ticker) do nothing;

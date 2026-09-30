@@ -206,6 +206,21 @@ class SupabaseManager:
         return bool(res.data)
 
     @with_retry
+    async def get_processed_ids_since(self, since_iso: str) -> set[str]:
+        """news_id già prenotati dalla data indicata (PostgREST restituisce max 1000 righe per pagina)."""
+        ids: set[str] = set()
+        offset, page = 0, 1000
+        while True:
+            res = await (self.client.table("processed_news").select("news_id")
+                         .gte("processed_at", since_iso)
+                         .range(offset, offset + page - 1).execute())
+            rows = res.data or []
+            ids.update(r["news_id"] for r in rows)
+            if len(rows) < page:
+                return ids
+            offset += page
+
+    @with_retry
     async def claim_news(self, news_id: str, ticker: str, headline: Optional[str] = None) -> bool:
         """Prenotazione atomica: True solo se questa esecuzione è la prima a vedere la notizia."""
         res = await self.client.rpc("claim_news", {

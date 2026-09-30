@@ -141,7 +141,7 @@ class AlpacaManager:
         sort: str = "desc",
         include_content: bool = True,
         start: Optional[str] = None,
-        max_pages: int = 10,
+        max_pages: int = 30,
     ) -> list[NewsItem]:
         """
         Recupera le notizie per i simboli specificati (endpoint /v1beta1/news).
