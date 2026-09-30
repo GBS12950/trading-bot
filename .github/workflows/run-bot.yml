@@ -22,6 +22,9 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       SENTIMENT_MODE: vader
       DRY_RUN: "false"
+      # since_close = notizie dalla chiusura precedente | minutes = ultime NEWS_MAX_AGE_MINUTES
+      NEWS_WINDOW: since_close
+      NEWS_MAX_AGE_MINUTES: "60"
     steps:
       - uses: actions/checkout@v5
 

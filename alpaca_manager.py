@@ -137,19 +137,22 @@ class AlpacaManager:
     async def get_news(
         self,
         symbols: Optional[list[str]] = None,
-        limit: int = 100,
+        limit: int = 50,
         sort: str = "desc",
         include_content: bool = True,
+        start: Optional[str] = None,
+        max_pages: int = 10,
     ) -> list[NewsItem]:
         """
-        Recupera le ultime notizie per i simboli specificati.
-        Usa l'endpoint /v1beta1/news
+        Recupera le notizie per i simboli specificati (endpoint /v1beta1/news).
 
         Args:
             symbols: Lista di ticker (es. ['AAPL', 'MSFT'])
-            limit: Numero massimo di notizie
+            limit: Notizie per pagina (max 50 per Alpaca)
             sort: 'asc' o 'desc'
             include_content: Se True, include headline e summary
+            start: Timestamp RFC3339: se indicato scarica tutte le notizie da quel momento
+            max_pages: Limite di pagine quando start è indicato
 
         Returns:
             Lista di NewsItem
@@ -157,30 +160,33 @@ class AlpacaManager:
         if not symbols:
             symbols = ["*"]  # Tutte le notizie
 
-        # Costruisci il query string
-        symbol_str = ",".join(symbols)
-        params = {
-            "symbols": symbol_str,
-            "limit": limit,
+        params: dict[str, Any] = {
+            "symbols": ",".join(symbols),
+            "limit": min(limit, 50),
             "sort": sort,
         }
+        if start:
+            params["start"] = start
 
         try:
-            # Usa l'endpoint dati (diverse credenziali)
             headers = {
                 "APCA-API-KEY-ID": self.api_key,
                 "APCA-API-SECRET-KEY": self.secret_key,
             }
+            items: list[dict[str, Any]] = []
             async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
-                res = await client.get(
-                    f"{self.data_url}/v1beta1/news",
-                    params=params,
-                )
-                res.raise_for_status()
-                data = res.json()
+                for _ in range(max_pages if start else 1):
+                    res = await client.get(f"{self.data_url}/v1beta1/news", params=params)
+                    res.raise_for_status()
+                    data = res.json()
+                    items.extend(data.get("news", []))
+                    token = data.get("next_page_token")
+                    if not token:
+                        break
+                    params["page_token"] = token
 
             news_list = []
-            for item in data.get("news", []):
+            for item in items:
                 news_list.append(
                     NewsItem(
                         id=item.get("id", ""),

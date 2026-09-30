@@ -15,7 +15,7 @@ import asyncio
 import logging
 import os
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -32,18 +32,20 @@ SENTIMENT_SELL_THRESHOLD = -0.3  # Sell se sentiment < -0.3
 MIN_CONFIDENCE = 0.5             # Ignora se confidence < 0.5
 POSITION_SIZE_PCT = 0.1          # 10% del portfolio per trade
 MAX_NOTIONAL = 1000.0            # Default se il ticker non ha max_notional
-MAX_NEWS_AGE_MINUTES = 60        # Ignora notizie più vecchie
+# Finestra notizie: "since_close" = dalla chiusura della sessione precedente,
+# "minutes" = solo le ultime NEWS_MAX_AGE_MINUTES
+NEWS_WINDOW = os.getenv("NEWS_WINDOW", "since_close").lower()
+MAX_NEWS_AGE_MINUTES = int(os.getenv("NEWS_MAX_AGE_MINUTES", "60"))
 MAX_DAILY_LOSS_PCT = 0.02        # Stop nuove operazioni se il portafoglio perde il 2% nel giorno
 LOSS_LIMIT_MSG = "Limite di perdita giornaliera raggiunto"
 NY = ZoneInfo("America/New_York")
 
 
-def _news_age_minutes(created_at: str) -> float:
+def _parse_ts(value: str) -> Optional[datetime]:
     try:
-        ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
-        return float("inf")
-    return (datetime.now(timezone.utc) - ts).total_seconds() / 60
+        return None
 
 
 class NewsBot:
@@ -116,9 +118,12 @@ class NewsBot:
 
             logger.info("Ticker attivi: %s", tickers)
 
-            # 2. Recupera le notizie
+            # 2. Recupera le notizie della finestra configurata
+            window_start, window_label = await self._news_window_start()
             try:
-                news_items = await self.alpaca.get_news(symbols=tickers, limit=50)
+                news_items = await self.alpaca.get_news(
+                    symbols=tickers, start=window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
             except AlpacaConnectionError as exc:
                 await self.supabase.log("ERROR", f"Impossibile recuperare notizie: {exc}")
                 return
@@ -133,12 +138,12 @@ class NewsBot:
             active = {t.upper() for t in tickers}
             stats: Counter[str] = Counter()
             for news in news_items:
-                stats[await self._process_news(news, active)] += 1
+                stats[await self._process_news(news, active, window_start)] += 1
 
             await self.supabase.log(
                 "INFO",
-                f"Notizie: {len(news_items)} scaricate, {stats['old']} più vecchie di "
-                f"{MAX_NEWS_AGE_MINUTES} min, {stats['seen']} già elaborate, {stats['new']} nuove",
+                f"Notizie ({window_label}): {len(news_items)} scaricate, {stats['old']} fuori finestra, "
+                f"{stats['seen']} già elaborate, {stats['new']} nuove",
                 context=dict(stats),
             )
 
@@ -163,7 +168,25 @@ class NewsBot:
             await self.notifier.notify(f"<b>Stop giornaliero</b>\n{esc(msg)}")
         return True
 
-    async def _process_news(self, news, active: set[str]) -> str:
+    async def _news_window_start(self) -> tuple[datetime, str]:
+        """Inizio della finestra notizie secondo NEWS_WINDOW."""
+        now = datetime.now(timezone.utc)
+        if NEWS_WINDOW == "minutes":
+            return now - timedelta(minutes=MAX_NEWS_AGE_MINUTES), f"ultimi {MAX_NEWS_AGE_MINUTES} min"
+
+        today = datetime.now(NY).date()
+        calendar = await self.alpaca.get_json(
+            "/v2/calendar",
+            {"start": (today - timedelta(days=10)).isoformat(), "end": today.isoformat()},
+        )
+        previous = [d for d in calendar or [] if d.get("date", "") < today.isoformat()]
+        if not previous:
+            return now - timedelta(hours=24), "ultime 24 ore"
+        hour, minute = map(int, previous[-1]["close"].split(":")[:2])
+        close_ny = datetime.fromisoformat(previous[-1]["date"]).replace(hour=hour, minute=minute, tzinfo=NY)
+        return close_ny.astimezone(timezone.utc), f"dalla chiusura del {close_ny:%d/%m %H:%M} NY"
+
+    async def _process_news(self, news, active: set[str], window_start: datetime) -> str:
         """Processa una notizia e ritorna l'esito: untracked, old, seen o new."""
         if not self.supabase or not self.alpaca or not self.analyzer:
             return "untracked"
@@ -175,9 +198,8 @@ class NewsBot:
         if not tickers:
             return "untracked"
 
-        age = _news_age_minutes(news.created_at)
-        if age > MAX_NEWS_AGE_MINUTES:
-            logger.debug("News %s troppo vecchia (%.0f min)", news.id, age)
+        created = _parse_ts(news.created_at)
+        if created is None or created < window_start:
             return "old"
 
         logger.info("Processing news %s: %s", news.id, headline[:60])
