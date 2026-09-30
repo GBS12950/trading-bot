@@ -3,7 +3,7 @@ name: Run trading bot
 on:
   schedule:
     # Ogni 10 min, lun-ven, 13-21 UTC (copre l'orario NYSE con ora legale e solare)
-    - cron: "*/10 13-21 * * 1-5"
+    - cron: "*/59 13-21 * * 1-5"
   workflow_dispatch:
 
 permissions:
