@@ -1,0 +1,46 @@
+name: Test order
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Ticker (es. F, AAPL)"
+        required: true
+        default: "F"
+      side:
+        description: "Lato"
+        required: true
+        type: choice
+        options: [buy, sell]
+        default: buy
+      qty:
+        description: "Quantità (azioni intere)"
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  test-order:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TEST_SYMBOL: ${{ inputs.symbol }}
+      TEST_SIDE: ${{ inputs.side }}
+      TEST_QTY: ${{ inputs.qty }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Place test order
+        run: python test_order.py

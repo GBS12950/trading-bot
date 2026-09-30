@@ -280,6 +280,13 @@ class AlpacaManager:
             )
             return order
 
+        except httpx.HTTPStatusError as exc:
+            # Il motivo del rifiuto (es. titolo non shortabile, fondi insufficienti) è nel body
+            detail = exc.response.text[:300]
+            logger.error("Ordine rifiutato da Alpaca (%s): %s", exc.response.status_code, detail)
+            raise AlpacaConnectionError(
+                f"Ordine rifiutato da Alpaca ({exc.response.status_code}): {detail}"
+            ) from exc
         except httpx.HTTPError as exc:
             logger.error("Errore nell'invio ordine a Alpaca: %s", exc)
             raise AlpacaConnectionError(f"Impossibile inviare ordine: {exc}") from exc
@@ -323,27 +330,39 @@ class AlpacaManager:
 
     # ------------------------------------------------------------------ market data
     async def get_quote(self, symbol: str) -> dict[str, Any]:
-        """Recupera il quote (bid/ask) per un simbolo."""
+        """Recupera bid/ask; se mancano (frequente sul feed IEX) usa l'ultimo prezzo scambiato."""
+        import os
+        # Il piano gratuito non include i dati SIP in tempo reale: serve il feed IEX
+        params = {"feed": os.getenv("ALPACA_DATA_FEED", "iex")}
+        headers = {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.secret_key,
+        }
         try:
-            headers = {
-                "APCA-API-KEY-ID": self.api_key,
-                "APCA-API-SECRET-KEY": self.secret_key,
-            }
             async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
-                res = await client.get(
-                    f"{self.data_url}/v2/stocks/{symbol}/latest/quote",
-                )
+                res = await client.get(f"{self.data_url}/v2/stocks/{symbol}/quotes/latest", params=params)
                 res.raise_for_status()
-                data = res.json()
-                quote = data.get("quote", {})
+                quote = res.json().get("quote") or {}
+                bid, ask = quote.get("bp") or 0.0, quote.get("ap") or 0.0
+
+                last = 0.0
+                if not bid or not ask:
+                    res = await client.get(f"{self.data_url}/v2/stocks/{symbol}/trades/latest", params=params)
+                    res.raise_for_status()
+                    last = (res.json().get("trade") or {}).get("p") or 0.0
+
                 return {
-                    "bid_price": quote.get("bp"),
-                    "ask_price": quote.get("ap"),
+                    "bid_price": bid or ask or last or None,
+                    "ask_price": ask or bid or last or None,
                     "bid_size": quote.get("bs"),
                     "ask_size": quote.get("as"),
+                    "last_price": last or None,
                 }
+        except httpx.HTTPStatusError as exc:
+            logger.error("Errore quote %s (%s): %s", symbol, exc.response.status_code, exc.response.text[:200])
+            return {}
         except httpx.HTTPError as exc:
-            logger.error("Errore nel recupero quote: %s", exc)
+            logger.error("Errore nel recupero quote %s: %s", symbol, exc)
             return {}
 
 
