@@ -24,7 +24,10 @@ logger = logging.getLogger("supabase_manager")
 T = TypeVar("T")
 
 # Codici PostgreSQL/PostgREST da NON ritentare (errori logici, non transitori)
-_NON_RETRYABLE_PG_CODES = {"23505", "23503", "23514", "22P02", "42501", "PGRST116", "PGRST301"}
+_NON_RETRYABLE_PG_CODES = {
+    "23505", "23503", "23514", "22P02", "42501", "42P01", "42883",
+    "PGRST116", "PGRST202", "PGRST204", "PGRST205", "PGRST301",
+}
 
 VALID_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 VALID_NEWS_STATUS = {"CLAIMED", "SKIPPED", "ORDERED", "FAILED"}
@@ -109,7 +112,8 @@ class SupabaseManager:
                 logger.info("Connessione a Supabase stabilita (run_id=%s)", self.run_id)
                 return self
             except Exception as exc:  # noqa: BLE001
-                if attempt == policy.max_attempts or not (_is_retryable(exc) or isinstance(exc, SupabaseConnectionError)):
+                await self.close()
+                if attempt == policy.max_attempts or not _is_retryable(exc):
                     raise SupabaseConnectionError(f"Connessione fallita: {exc}") from exc
                 delay = min(policy.max_delay, policy.base_delay * 2 ** (attempt - 1))
                 logger.warning("Connessione fallita (%d/%d): %s. Retry tra %.2fs",
@@ -171,6 +175,20 @@ class SupabaseManager:
         res = await self.client.table("active_tickers").select("ticker").eq("is_active", True).execute()
         return [r["ticker"] for r in (res.data or [])]
 
+    # ------------------------------------------------------------------ secrets
+    @with_retry
+    async def get_secret(self, name: str) -> Optional[str]:
+        """Legge un segreto da Supabase Vault tramite RPC riservata al service_role."""
+        res = await self.client.rpc("get_secret", {"p_name": name}).execute()
+        return res.data or None
+
+    async def resolve_secret(self, name: str) -> str:
+        """Env var (es. GitHub Actions secrets) con fallback su Vault."""
+        value = os.getenv(name) or await self.get_secret(name)
+        if not value:
+            raise ValueError(f"Segreto '{name}' non trovato né in env né in Supabase Vault.")
+        return value
+
     # ------------------------------------------------------------------ news
     @with_retry
     async def is_news_processed(self, news_id: str) -> bool:
@@ -222,6 +240,10 @@ async def _smoke_test() -> None:
         assert first and not second, "Deduplica non funzionante!"
         await db.update_news_status(test_id, "SKIPPED", sentiment_score=0.0)
         logger.info("Ticker attivi: %s | Deduplica OK", tickers)
+
+        for name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+            found = bool(await db.get_secret(name))
+            logger.info("Vault %s: %s", name, "presente" if found else "MANCANTE")
 
 
 if __name__ == "__main__":

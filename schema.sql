@@ -91,6 +91,27 @@ end $$;
 revoke all on function public.claim_news(text, text, text) from public, anon, authenticated;
 grant execute on function public.claim_news(text, text, text) to service_role;
 
+-- ---------- RPC: lettura segreti da Supabase Vault ----------
+-- Creare i segreti con: select vault.create_secret('<valore>', 'ALPACA_API_KEY');
+create or replace function public.get_secret(p_name text)
+returns text
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare v_secret text;
+begin
+    select ds.decrypted_secret into v_secret
+    from vault.decrypted_secrets ds
+    where ds.name = p_name
+    limit 1;
+    return v_secret;
+end $$;
+
+revoke all on function public.get_secret(text) from public, anon, authenticated;
+grant execute on function public.get_secret(text) to service_role;
+
 -- ---------- RLS: nessun accesso pubblico ----------
 alter table public.bot_logs       enable row level security;
 alter table public.processed_news enable row level security;
