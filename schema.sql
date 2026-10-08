@@ -112,7 +112,36 @@ end $$;
 revoke all on function public.get_secret(text) from public, anon, authenticated;
 grant execute on function public.get_secret(text) to service_role;
 
+-- ---------- bot_heartbeat: segnale di vita del bot (riga unica) ----------
+create table if not exists public.bot_heartbeat (
+    id           int primary key default 1 check (id = 1),
+    last_seen    timestamptz,
+    started_at   timestamptz,
+    down_alerted boolean not null default false
+);
+
+-- Registra il segnale e ritorna lo stato precedente, per capire se il bot era fermo o riavviato
+create or replace function public.bot_ping(p_started boolean default false)
+returns table (prev_seen timestamptz, prev_alerted boolean)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    insert into public.bot_heartbeat (id) values (1) on conflict (id) do nothing;
+    return query select h.last_seen, h.down_alerted from public.bot_heartbeat h where h.id = 1;
+    update public.bot_heartbeat
+       set last_seen = now(),
+           down_alerted = false,
+           started_at = case when p_started then now() else started_at end
+     where id = 1;
+end $$;
+
+revoke all on function public.bot_ping(boolean) from public, anon, authenticated;
+grant execute on function public.bot_ping(boolean) to service_role;
+
 -- ---------- RLS: nessun accesso pubblico ----------
+alter table public.bot_heartbeat  enable row level security;
 alter table public.bot_logs       enable row level security;
 alter table public.processed_news enable row level security;
 alter table public.active_tickers enable row level security;

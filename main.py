@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -23,6 +24,7 @@ from alpaca_manager import AlpacaManager, AlpacaConnectionError
 from sentiment_analyzer import SentimentAnalyzer
 from supabase_manager import SupabaseManager
 from telegram_notifier import TelegramNotifier, esc
+from translator import translate_to_italian
 
 logger = logging.getLogger("news_sentiment_bot")
 
@@ -40,7 +42,10 @@ MAX_DAILY_LOSS_PCT = 0.02        # Stop nuove operazioni se il portafoglio perde
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 LOSS_LIMIT_MSG = "Limite di perdita giornaliera raggiunto"
 NY = ZoneInfo("America/New_York")
-MAX_CLOSED_SLEEP_SECONDS = 3600  # A mercato chiuso ricontrolla almeno ogni ora
+ROME = ZoneInfo("Europe/Rome")
+STOP_LOSS_PCT = 0.02
+TAKE_PROFIT_PCT = 0.05
+MAX_CLOSED_SLEEP_SECONDS = 300   # A mercato chiuso si risveglia almeno ogni 5 minuti per il segnale di vita
 NEWS_OVERLAP_MINUTES = 10        # In modalità continua rilegge gli ultimi minuti per non perdere notizie in ritardo
 ALERT_COOLDOWN_MINUTES = 30      # Un avviso Telegram di errore ogni 30 minuti al massimo
 
@@ -50,6 +55,11 @@ def _parse_ts(value: str) -> Optional[datetime]:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
+
+
+def _clip(text: str, limit: int = 400) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "..."
 
 
 class NewsBot:
@@ -278,9 +288,9 @@ class NewsBot:
 
                 # Decidi se comprare, vendere, o skippare
                 if sentiment.score > SENTIMENT_BUY_THRESHOLD:
-                    await self._execute_trade(news_id, ticker, "buy", sentiment.score, headline)
+                    await self._execute_trade(news_id, ticker, "buy", sentiment.score, headline, news)
                 elif sentiment.score < SENTIMENT_SELL_THRESHOLD:
-                    await self._execute_trade(news_id, ticker, "sell", sentiment.score, headline)
+                    await self._execute_trade(news_id, ticker, "sell", sentiment.score, headline, news)
                 else:
                     logger.info("Sentiment neutrale per %s: %.4f", ticker, sentiment.score)
                     await self.supabase.update_news_status(news_id, "SKIPPED")
@@ -291,7 +301,8 @@ class NewsBot:
 
         return "new" if processed else "seen"
 
-    async def _execute_trade(self, news_id: str, ticker: str, side: str, sentiment: float, headline: str) -> None:
+    async def _execute_trade(self, news_id: str, ticker: str, side: str, sentiment: float,
+                             headline: str, news=None) -> None:
         """Esegue un trade basato sul sentiment."""
         if not self.supabase or not self.alpaca:
             return
@@ -356,8 +367,8 @@ class NewsBot:
                 qty=qty,
                 side=side,
                 entry_price=entry_price,
-                stop_loss_pct=0.02,
-                take_profit_pct=0.05,
+                stop_loss_pct=STOP_LOSS_PCT,
+                take_profit_pct=TAKE_PROFIT_PCT,
             )
 
             logger.info("Order placed: %s (status=%s)", order.order_id, order.status)
@@ -388,17 +399,89 @@ class NewsBot:
                 ticker=ticker,
                 context={"order_id": order.order_id, "sentiment": sentiment},
             )
-            await self.notifier.notify(
-                f"<b>{side.upper()} {qty} {esc(ticker)}</b> @ ${entry_price:,.2f}\n"
-                f"SL ${sl_price:,.2f} | TP ${tp_price:,.2f} | sentiment {sentiment:+.2f}\n"
-                f"<i>{esc(headline[:200])}</i>"
+            await self._notify_trade(
+                side=side, qty=qty, ticker=ticker, entry_price=entry_price,
+                sl_price=sl_price, tp_price=tp_price, sentiment=sentiment,
+                headline=headline, news=news,
             )
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Errore nell'esecuzione del trade")
             await self.supabase.log("ERROR", f"Errore nell'esecuzione trade: {exc}", ticker=ticker)
             await self.supabase.update_news_status(news_id, "FAILED")
-            await self.notifier.notify(f"<b>Ordine fallito su {esc(ticker)}</b>\n{esc(exc)}")
+            await self.notifier.notify(
+                f"<b>Ordine fallito su {esc(ticker)}</b> ({'acquisto' if side == 'buy' else 'vendita'})\n"
+                f"{esc(exc)}\n<i>{esc(headline[:200])}</i>"
+            )
+
+    async def _notify_trade(self, *, side: str, qty: int, ticker: str, entry_price: float,
+                            sl_price: float, tp_price: float, sentiment: float,
+                            headline: str, news=None) -> None:
+        """Avviso Telegram: tipo di operazione, livelli e notizia che l'ha generata (tradotta)."""
+        summary = (getattr(news, "summary", "") or "").strip()
+        it_headline, it_summary = await asyncio.gather(
+            translate_to_italian(headline), translate_to_italian(summary)
+        )
+
+        is_buy = side == "buy"
+        threshold = SENTIMENT_BUY_THRESHOLD if is_buy else SENTIMENT_SELL_THRESHOLD
+        sl_sign, tp_sign = ("-", "+") if is_buy else ("+", "-")
+        lines = [
+            f"<b>{'ACQUISTO' if is_buy else 'VENDITA ALLO SCOPERTO (short)'}: {esc(ticker)}</b>",
+            f"{qty} azioni a ${entry_price:,.2f} (circa ${qty * entry_price:,.0f})",
+            f"Stop Loss ${sl_price:,.2f} ({sl_sign}{STOP_LOSS_PCT:.0%}) | "
+            f"Take Profit ${tp_price:,.2f} ({tp_sign}{TAKE_PROFIT_PCT:.0%})",
+            f"Motivo: sentiment {'positivo' if sentiment > 0 else 'negativo'} {sentiment:+.2f} "
+            f"(soglia {threshold:+.2f})",
+            "",
+            "<b>Notizia che ha generato l'operazione</b>",
+        ]
+
+        meta = []
+        if getattr(news, "source", ""):
+            meta.append(esc(news.source))
+        created = _parse_ts(getattr(news, "created_at", ""))
+        if created:
+            meta.append(created.astimezone(ROME).strftime("%d/%m %H:%M"))
+        if meta:
+            lines.append(" - ".join(meta))
+
+        lines.append(f"<i>{esc(it_headline or headline)}</i>")
+        if summary:
+            lines.append(esc(it_summary or _clip(summary)))
+        lines.append(f"Originale: {esc(headline)}" if it_headline else "(traduzione non disponibile)")
+
+        url = getattr(news, "url", "") or ""
+        if url.startswith(("http://", "https://")):
+            lines.append(f'<a href="{esc(url)}">Leggi la notizia</a>')
+
+        await self.notifier.notify("\n".join(lines))
+
+    async def heartbeat(self, started: bool = False) -> None:
+        """Segnale di vita su Supabase; avvisa su Telegram di avvii, riavvii e ritorni online."""
+        try:
+            prev = await self.supabase.bot_ping(started=started)
+        except Exception as exc:  # noqa: BLE001
+            if self._should_alert("heartbeat"):
+                logger.warning("Segnale di vita non registrato (schema.sql aggiornato?): %s", exc)
+            return
+
+        host = esc(socket.gethostname())
+        prev_seen = _parse_ts((prev or {}).get("prev_seen"))
+        silent = int((datetime.now(timezone.utc) - prev_seen).total_seconds() // 60) if prev_seen else 0
+        last_txt = prev_seen.astimezone(ROME).strftime("%d/%m %H:%M") if prev_seen else ""
+
+        if (prev or {}).get("prev_alerted"):
+            await self.notifier.notify(
+                f"<b>Bot di nuovo online</b> su {host}\n"
+                f"Nessun segnale per circa {silent} minuti (dalle {last_txt})."
+            )
+        elif started and prev_seen is None:
+            await self.notifier.notify(f"<b>Bot avviato</b> su {host} (primo avvio)")
+        elif started:
+            await self.notifier.notify(
+                f"<b>Bot riavviato</b> su {host}\nUltimo segnale: {last_txt} ({silent} minuti fa)."
+            )
 
     async def seconds_until_open(self) -> float:
         """0 se il mercato è aperto, altrimenti i secondi alla prossima apertura."""
@@ -414,15 +497,16 @@ async def _run_forever(mode: str, dry_run: bool, interval: int) -> None:
     """Modalità continua (Raspberry Pi): un ciclo ogni `interval` secondi a mercato aperto."""
     logger.info("Modalità continua avviata (intervallo=%ds, dry_run=%s)", interval, dry_run)
     bot: Optional[NewsBot] = None
-    announced = False
+    started_announced = False
     while True:
         wait: float = interval
         try:
             if bot is None:
                 bot = await NewsBot(sentiment_mode=mode, dry_run=dry_run, continuous=True).connect()
-                if not announced:
-                    await bot.notifier.notify("<b>Bot avviato</b> in modalità continua")
-                    announced = True
+
+            # Segnale di vita ad ogni giro, anche a mercato chiuso: lo controlla il watchdog su Supabase
+            await bot.heartbeat(started=not started_announced)
+            started_announced = True
 
             until_open = await bot.seconds_until_open()
             if until_open > 0:

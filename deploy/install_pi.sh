@@ -57,6 +57,9 @@ Environment=RUN_FOREVER=true
 Environment=LOOP_INTERVAL_SECONDS=60
 Environment=PYTHONUNBUFFERED=1
 ExecStart=${APP_DIR}/.venv/bin/python main.py
+# Avviso Telegram ad ogni arresto o crash (il "-" ignora un eventuale errore dell'avviso stesso)
+ExecStopPost=-${APP_DIR}/.venv/bin/python notify_event.py stop
+TimeoutStopSec=45
 Restart=always
 RestartSec=30
 

@@ -264,6 +264,14 @@ class SupabaseManager:
                      .gte("timestamp", since_iso).limit(1).execute())
         return bool(res.data)
 
+    # ------------------------------------------------------------------ heartbeat
+    @with_retry
+    async def bot_ping(self, started: bool = False) -> Optional[dict[str, Any]]:
+        """Segnala che il bot \u00e8 vivo; ritorna lo stato precedente (prev_seen, prev_alerted)."""
+        res = await self.client.rpc("bot_ping", {"p_started": started}).execute()
+        rows = res.data or []
+        return rows[0] if rows else None
+
 
 # ---------------------------------------------------------------------- smoke test
 async def _smoke_test() -> None:
