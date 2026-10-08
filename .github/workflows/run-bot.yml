@@ -1,9 +1,7 @@
 name: Run trading bot
 
 on:
-  schedule:
-    # Ogni 10 min, lun-ven, 13-21 UTC (copre l'orario NYSE con ora legale e solare)
-    - cron: "*/59 13-21 * * 1-5"
+  # La pianificazione ogni 10 minuti è ora gestita dal Raspberry Pi; qui resta l'avvio manuale
   workflow_dispatch:
 
 permissions:

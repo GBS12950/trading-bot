@@ -40,6 +40,9 @@ MAX_DAILY_LOSS_PCT = 0.02        # Stop nuove operazioni se il portafoglio perde
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 LOSS_LIMIT_MSG = "Limite di perdita giornaliera raggiunto"
 NY = ZoneInfo("America/New_York")
+MAX_CLOSED_SLEEP_SECONDS = 3600  # A mercato chiuso ricontrolla almeno ogni ora
+NEWS_OVERLAP_MINUTES = 10        # In modalità continua rilegge gli ultimi minuti per non perdere notizie in ritardo
+ALERT_COOLDOWN_MINUTES = 30      # Un avviso Telegram di errore ogni 30 minuti al massimo
 
 
 def _parse_ts(value: str) -> Optional[datetime]:
@@ -56,14 +59,18 @@ class NewsBot:
         self,
         sentiment_mode: str = "vader",
         dry_run: bool = False,
+        continuous: bool = False,
     ) -> None:
         self.sentiment_mode = sentiment_mode
         self.dry_run = dry_run
+        self.continuous = continuous
         self.supabase: Optional[SupabaseManager] = None
         self.alpaca: Optional[AlpacaManager] = None
         self.analyzer: Optional[SentimentAnalyzer] = None
         self.notifier = TelegramNotifier(None, None)
         self._limits: dict[str, float] = {}
+        self._last_news_fetch: Optional[datetime] = None
+        self._last_alert: dict[str, datetime] = {}
 
     async def connect(self) -> "NewsBot":
         """Inizializza le connessioni a Supabase e Alpaca."""
@@ -100,11 +107,13 @@ class NewsBot:
         if not self.supabase or not self.alpaca or not self.analyzer:
             raise RuntimeError("Bot non connesso")
 
-        await self.supabase.log("INFO", "Bot loop started")
+        if not self.continuous:
+            await self.supabase.log("INFO", "Bot loop started")
 
         try:
             if not await self.alpaca.is_market_open():
-                await self.supabase.log("INFO", "Mercato chiuso: nessuna operazione")
+                if not self.continuous:
+                    await self.supabase.log("INFO", "Mercato chiuso: nessuna operazione")
                 return
 
             if await self._daily_loss_limit_hit(await self.alpaca.get_account()):
@@ -121,16 +130,30 @@ class NewsBot:
 
             # 2. Recupera le notizie della finestra configurata
             window_start, window_label = await self._news_window_start()
+            if self.continuous and self._last_news_fetch:
+                # Dal secondo ciclo in poi basta rileggere dall'ultimo controllo
+                narrowed = self._last_news_fetch - timedelta(minutes=NEWS_OVERLAP_MINUTES)
+                if narrowed > window_start:
+                    window_start, window_label = narrowed, "dall'ultimo controllo"
+
+            fetch_started = datetime.now(timezone.utc)
             try:
                 news_items = await self.alpaca.get_news(
                     symbols=tickers, start=window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
                 )
             except AlpacaConnectionError as exc:
-                await self.supabase.log("ERROR", f"Impossibile recuperare notizie: {exc}")
+                logger.error("Impossibile recuperare notizie: %s", exc)
+                if self._should_alert("news"):
+                    await self.supabase.log("ERROR", f"Impossibile recuperare notizie: {exc}")
+                    await self.notifier.notify(f"<b>Notizie non disponibili</b>\n{esc(exc)}")
                 return
 
+            self._last_news_fetch = fetch_started
             if not news_items:
-                await self.supabase.log("INFO", "Nessuna notizia trovata")
+                if self.continuous:
+                    logger.info("Nessuna notizia trovata")
+                else:
+                    await self.supabase.log("INFO", "Nessuna notizia trovata")
                 return
 
             logger.info("Recuperate %d notizie", len(news_items))
@@ -142,17 +165,30 @@ class NewsBot:
             for news in news_items:
                 stats[await self._process_news(news, active, window_start, seen)] += 1
 
-            await self.supabase.log(
-                "INFO",
+            summary_msg = (
                 f"Notizie ({window_label}): {len(news_items)} scaricate, {stats['old']} fuori finestra, "
-                f"{stats['seen']} già elaborate, {stats['new']} nuove",
-                context=dict(stats),
+                f"{stats['seen']} già elaborate, {stats['new']} nuove"
             )
+            # In modalità continua scrive su Supabase solo quando c'è qualcosa di nuovo
+            if stats["new"] or not self.continuous:
+                await self.supabase.log("INFO", summary_msg, context=dict(stats))
+            else:
+                logger.info(summary_msg)
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Errore nel loop del bot")
-            await self.supabase.log("ERROR", f"Errore nel bot loop: {exc}")
-            await self.notifier.notify(f"<b>Errore nel bot</b>\n{esc(exc)}")
+            if self._should_alert("loop"):
+                await self.supabase.log("ERROR", f"Errore nel bot loop: {exc}")
+                await self.notifier.notify(f"<b>Errore nel bot</b>\n{esc(exc)}")
+
+    def _should_alert(self, key: str) -> bool:
+        """Evita di ripetere lo stesso avviso ogni minuto durante un'interruzione prolungata."""
+        now = datetime.now(timezone.utc)
+        last = self._last_alert.get(key)
+        if last and now - last < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+            return False
+        self._last_alert[key] = now
+        return True
 
     async def _daily_loss_limit_hit(self, account: dict[str, Any]) -> bool:
         start = float(account.get("last_equity") or 0)
@@ -165,8 +201,10 @@ class NewsBot:
         already_notified = await self.supabase.has_log_since(
             LOSS_LIMIT_MSG, day_start.astimezone(timezone.utc).isoformat()
         )
-        await self.supabase.log("WARNING", msg)
-        if not already_notified:
+        if already_notified:
+            logger.warning(msg)
+        else:
+            await self.supabase.log("WARNING", msg)
             await self.notifier.notify(f"<b>Stop giornaliero</b>\n{esc(msg)}")
         return True
 
@@ -362,20 +400,45 @@ class NewsBot:
             await self.supabase.update_news_status(news_id, "FAILED")
             await self.notifier.notify(f"<b>Ordine fallito su {esc(ticker)}</b>\n{esc(exc)}")
 
-    async def run_scheduled(self, interval_seconds: int = 300) -> None:
-        """Esegue il bot periodicamente (intervallo in secondi)."""
-        logger.info("Bot scheduled loop avviato (intervallo=%ds)", interval_seconds)
-        try:
-            while True:
-                await self.run_once()
-                await asyncio.sleep(interval_seconds)
-        except KeyboardInterrupt:
-            logger.info("Bot fermato dall'utente")
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Errore fatale nel scheduled loop")
+    async def seconds_until_open(self) -> float:
+        """0 se il mercato è aperto, altrimenti i secondi alla prossima apertura."""
+        clock = await self.alpaca.get_json("/v2/clock")
+        if clock.get("is_open"):
+            return 0.0
+        next_open = datetime.fromisoformat(clock["next_open"].replace("Z", "+00:00"))
+        return max(0.0, (next_open - datetime.now(timezone.utc)).total_seconds())
 
 
 # ---------------------------------------------------------------------- entry point
+async def _run_forever(mode: str, dry_run: bool, interval: int) -> None:
+    """Modalità continua (Raspberry Pi): un ciclo ogni `interval` secondi a mercato aperto."""
+    logger.info("Modalità continua avviata (intervallo=%ds, dry_run=%s)", interval, dry_run)
+    bot: Optional[NewsBot] = None
+    announced = False
+    while True:
+        wait: float = interval
+        try:
+            if bot is None:
+                bot = await NewsBot(sentiment_mode=mode, dry_run=dry_run, continuous=True).connect()
+                if not announced:
+                    await bot.notifier.notify("<b>Bot avviato</b> in modalità continua")
+                    announced = True
+
+            until_open = await bot.seconds_until_open()
+            if until_open > 0:
+                wait = min(until_open + 5, MAX_CLOSED_SLEEP_SECONDS)
+                logger.info("Mercato chiuso, riapre tra %.0f min: attendo %.0f min",
+                            until_open / 60, wait / 60)
+            else:
+                await bot.run_once()
+        except Exception:  # noqa: BLE001
+            logger.exception("Ciclo fallito, riconnessione al prossimo giro")
+            if bot is not None:
+                await bot.close()
+                bot = None
+        await asyncio.sleep(wait)
+
+
 async def _main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -383,6 +446,10 @@ async def _main() -> None:
     )
     dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
     mode = os.getenv("SENTIMENT_MODE", "vader")
+
+    if os.getenv("RUN_FOREVER", "false").lower() == "true":
+        await _run_forever(mode, dry_run, int(os.getenv("LOOP_INTERVAL_SECONDS", "60")))
+        return
 
     async with NewsBot(sentiment_mode=mode, dry_run=dry_run) as bot:
         await bot.run_once()

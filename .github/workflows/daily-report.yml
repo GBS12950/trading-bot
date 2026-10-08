@@ -1,10 +1,7 @@
 name: Daily report
 
 on:
-  schedule:
-    # Chiusura NYSE: 20:00 UTC con ora legale USA, 21:00 UTC con ora solare.
-    # Lo script invia solo nell'ora successiva alla chiusura effettiva.
-    - cron: "10 20,21 * * 1-5"
+  # Il riepilogo serale è ora gestito dal Raspberry Pi; qui resta l'avvio manuale
   workflow_dispatch:
 
 permissions:
